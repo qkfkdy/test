@@ -2,156 +2,232 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8">
-  <title>Mastodon Jukebox</title>
+  <meta name="referrer" content="origin">
+  <title>Mastodon Live Jukebox</title>
   <style>
     body { font-family: sans-serif; background: #191b22; color: #fff; text-align: center; padding: 20px; }
-    #player { margin: 20px auto; max-width: 800px; }
-    .playlist { max-width: 600px; margin: 0 auto; text-align: left; background: #282c37; padding: 15px; border-radius: 8px; }
-    .playlist-item { padding: 8px; border-bottom: 1px solid #393f4f; cursor: pointer; }
-    .playlist-item.active { color: #6364ff; font-weight: bold; }
+    #player { margin: 20px auto; max-width: 800px; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.5); }
+    .now-playing { max-width: 600px; margin: 0 auto; background: #282c37; padding: 15px 20px; border-radius: 8px; border-left: 4px solid #6364ff; text-align: left; }
+    .badge { display: inline-block; background: #ff5555; color: #fff; font-size: 12px; font-weight: bold; padding: 3px 8px; border-radius: 4px; margin-right: 8px; animation: pulse 2s infinite; }
+    @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
   </style>
 </head>
 <body>
 
-  <h2>🎵 우리 서버 주크박스</h2>
-  <p id="status">타임라인에서 음악을 불러오는 중...</p>
+  <h2>🎵 우리 서버 실시간 주크박스</h2>
+  <p id="status">타임라인에서 최신 음악을 불러오는 중...</p>
   
   <div id="player"></div>
-  <div class="playlist" id="playlist"></div>
+  
+  <div class="now-playing" id="now-playing" style="display: none;">
+    <div><span class="badge">LIVE LOOP</span> <strong id="current-author"></strong>님의 선곡</div>
+    <div id="current-id" style="color: #9baec8; font-size: 14px; margin-top: 6px;"></div>
+  </div>
 
   <script src="https://www.youtube.com/iframe_api"></script>
   <script>
     // ==========================================
-    // 1. 서버 및 토큰 설정값 변경
+    // 1. 서버 및 토큰 설정값 (입력 완료)
     // ==========================================
-    const INSTANCE_DOMAIN = 'cryptb.site'; // 본인 마스토돈 도메인 (https:// 제외)
+    const INSTANCE_DOMAIN = 'cryptb.site';
     const ACCESS_TOKEN = '-cdF2VNAZ1cLyHYf0kHVB1pomunpeoieugyTtr6MuNw'; 
     
     // 수집 모드 선택: 'hashtag' (특정 해시태그), 'local' (로컬 타임라인 전체), 'account' (특정 계정이 작성한 툿)
     const FETCH_MODE = 'hashtag'; 
-    const HASHTAG = '노동요';       // FETCH_MODE가 'hashtag'일 때 사용할 태그명 (# 제외)
-    const ACCOUNT_ID = '117145132200298739'; // FETCH_MODE가 'account'일 때 사용할 대상 계정의 숫자 ID
+    const HASHTAG = '노동요';
+    const ACCOUNT_ID = '117145132200298739';
 
-    let videoIds = [];
-    let currentIndex = 0;
-    let player;
+    // 백업용 폴링 주기 (10초마다 최신 툿 재확인)
+    const POLLING_INTERVAL = 10000; 
 
-    // 2. 유튜브 Video ID 추출 정규식 (일반 영상, 쇼츠, 단축 URL, 뮤직 모두 대응)
-    function extractYouTubeId(url) {
-      const regExp = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?|shorts)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/i;
-      const match = url.match(regExp);
-      return match ? match[1] : null;
-    }
+    let currentVideo = null; // 현재 재생 중인 영상 정보 { id, author, tootId }
+    let blockedVideoIds = new Set(); // 외부 재생 제한(오류 153 등) 영상 블랙리스트
+    let player = null;
+    let isPlayerReady = false;
 
-    // 3. 수집 모드별 API URL 생성
-    function getApiUrl() {
-      if (FETCH_MODE === 'hashtag') {
-        return `https://${INSTANCE_DOMAIN}/api/v1/timelines/tag/${encodeURIComponent(HASHTAG)}?limit=40`;
-      } else if (FETCH_MODE === 'local') {
-        return `https://${INSTANCE_DOMAIN}/api/v1/timelines/public?local=true&limit=40`;
-      } else if (FETCH_MODE === 'account') {
-        return `https://${INSTANCE_DOMAIN}/api/v1/accounts/${ACCOUNT_ID}/statuses?limit=40&exclude_reblogs=false`;
+    // 2. 유튜브 11자리 Video ID 추출 (일반 영상, 쇼츠, 단축 URL, 뮤직 모두 대응)
+    function extractYouTubeId(rawUrl) {
+      try {
+        const url = new URL(rawUrl);
+        let videoId = null;
+
+        if (url.hostname.includes('youtu.be')) {
+          videoId = url.pathname.slice(1).split('/')[0];
+        } else if (url.hostname.includes('youtube.com')) {
+          if (url.searchParams.has('v')) {
+            videoId = url.searchParams.get('v');
+          } else if (url.pathname.startsWith('/shorts/') || url.pathname.startsWith('/embed/') || url.pathname.startsWith('/v/')) {
+            videoId = url.pathname.split('/')[2];
+          }
+        }
+        return (videoId && /^[a-zA-Z0-9_-]{11}$/.test(videoId)) ? videoId : null;
+      } catch (e) {
+        return null;
       }
     }
 
-    // 4. 마스토돈 API 호출 (Authorization 헤더 포함)
-    async function fetchToots() {
-      const apiUrl = getApiUrl();
-      
+    // 3. 단일 툿에서 유효한 유튜브 정보 추출
+    function parseTootForVideo(toot) {
+      const targetToot = toot.reblog ? toot.reblog : toot;
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(targetToot.content, 'text/html');
+      const links = doc.querySelectorAll('a');
+
+      for (const link of links) {
+        const videoId = extractYouTubeId(link.href);
+        if (videoId && !blockedVideoIds.has(videoId)) {
+          return {
+            id: videoId,
+            author: targetToot.account.display_name || targetToot.account.username,
+            tootId: toot.id
+          };
+        }
+      }
+      return null;
+    }
+
+    // 4. 수집 모드별 API URL 생성
+    function getApiUrl() {
+      if (FETCH_MODE === 'hashtag') {
+        return `https://${INSTANCE_DOMAIN}/api/v1/timelines/tag/${encodeURIComponent(HASHTAG)}?limit=20`;
+      } else if (FETCH_MODE === 'local') {
+        return `https://${INSTANCE_DOMAIN}/api/v1/timelines/public?local=true&limit=20`;
+      } else if (FETCH_MODE === 'account') {
+        return `https://${INSTANCE_DOMAIN}/api/v1/accounts/${ACCOUNT_ID}/statuses?limit=20&exclude_reblogs=false`;
+      }
+    }
+
+    // 5. 가장 최신 유튜브 링크 확인 및 갱신
+    async function checkLatestVideo() {
       try {
-        const response = await fetch(apiUrl, {
+        const response = await fetch(getApiUrl(), {
           method: 'GET',
           headers: {
             'Authorization': `Bearer ${ACCESS_TOKEN}`,
             'Content-Type': 'application/json'
-          }
+          },
+          cache: 'no-store'
         });
 
-        if (!response.ok) {
-          throw new Error(`HTTP Error: ${response.status}`);
+        if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+        const toots = await response.json();
+
+        let latestFound = null;
+        for (const toot of toots) {
+          const videoInfo = parseTootForVideo(toot);
+          if (videoInfo) {
+            latestFound = videoInfo;
+            break; 
+          }
         }
 
-        const toots = await response.json();
-        const parser = new DOMParser();
-
-        toots.forEach(toot => {
-          // 부스트(리블로그)한 툿일 경우 원본 툿의 내용을 가져옴
-          const targetToot = toot.reblog ? toot.reblog : toot;
-          const doc = parser.parseFromString(targetToot.content, 'text/html');
-          const links = doc.querySelectorAll('a');
-          
-          links.forEach(link => {
-            const videoId = extractYouTubeId(link.href);
-            if (videoId && !videoIds.some(item => item.id === videoId)) {
-              videoIds.push({
-                id: videoId,
-                author: targetToot.account.display_name || targetToot.account.username,
-                url: link.href
-              });
-            }
-          });
-        });
-
-        if (videoIds.length > 0) {
-          document.getElementById('status').innerText = `총 ${videoIds.length}개의 영상을 찾았습니다.`;
-          renderPlaylist();
-          initPlayer();
-        } else {
+        if (latestFound) {
+          // 현재 재생 중인 곡이 없거나, 새로운 영상 ID가 올라왔을 때 즉시 교체
+          if (!currentVideo || currentVideo.id !== latestFound.id) {
+            updateAndPlay(latestFound);
+          }
+        } else if (!currentVideo) {
           document.getElementById('status').innerText = '재생할 유튜브 링크를 찾지 못했습니다.';
         }
       } catch (error) {
         document.getElementById('status').innerText = `API 호출 실패 (${error.message}) - 토큰 권한이나 도메인을 확인하세요.`;
-        console.error(error);
+        console.error('최신 툿 확인 실패:', error);
       }
     }
 
-    // 5. 유튜브 플레이어 초기화 및 연속 재생
-    function initPlayer() {
+    // 6. 마스토돈 WebSocket 실시간 스트리밍 연결 (새 글 즉시 감지)
+    function connectWebSocket() {
+      let wsUrl = `wss://${INSTANCE_DOMAIN}/api/v1/streaming?access_token=${ACCESS_TOKEN}`;
+      if (FETCH_MODE === 'hashtag') {
+        wsUrl += `&stream=hashtag&tag=${encodeURIComponent(HASHTAG)}`;
+      } else if (FETCH_MODE === 'local') {
+        wsUrl += `&stream=public:local`;
+      } else if (FETCH_MODE === 'account') {
+        wsUrl += `&stream=user`;
+      }
+
+      const ws = new WebSocket(wsUrl);
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.event === 'update') {
+            const newToot = JSON.parse(data.payload);
+            
+            if (FETCH_MODE === 'account' && newToot.account.id !== ACCOUNT_ID) return;
+
+            const videoInfo = parseTootForVideo(newToot);
+            if (videoInfo && (!currentVideo || currentVideo.id !== videoInfo.id)) {
+              updateAndPlay(videoInfo);
+            }
+          }
+        } catch (e) {
+          console.error('WebSocket 메시지 파싱 오류:', e);
+        }
+      };
+
+      ws.onclose = () => {
+        setTimeout(connectWebSocket, 5000);
+      };
+    }
+
+    // 7. 새 영상으로 플레이어 전환 및 UI 업데이트
+    function updateAndPlay(videoInfo) {
+      currentVideo = videoInfo;
+      
+      document.getElementById('status').innerText = '실시간 수신 중 (새 링크가 올라오면 자동으로 바뀝니다)';
+      document.getElementById('now-playing').style.display = 'block';
+      document.getElementById('current-author').innerText = currentVideo.author;
+      document.getElementById('current-id').innerText = `Video ID: ${currentVideo.id} (무한 반복 재생 중)`;
+
+      if (!player) {
+        initPlayer(currentVideo.id);
+      } else if (isPlayerReady) {
+        player.loadVideoById(currentVideo.id);
+      }
+    }
+
+    // 8. 유튜브 플레이어 초기화
+    function initPlayer(videoId) {
       player = new YT.Player('player', {
         height: '450',
         width: '800',
-        videoId: videoIds[0].id,
-        playerVars: { 'autoplay': 1, 'rel': 0 },
+        videoId: videoId,
+        playerVars: { 
+          'autoplay': 1, 
+          'rel': 0,
+          'origin': window.location.origin 
+        },
         events: {
+          'onReady': () => { isPlayerReady = true; },
           'onStateChange': onPlayerStateChange,
-          'onError': playNext
+          'onError': onPlayerError
         }
       });
     }
 
+    // 영상이 끝나면(ENDED) 0초로 되돌려 같은 곡을 계속 무한 반복
     function onPlayerStateChange(event) {
       if (event.data === YT.PlayerState.ENDED) {
-        playNext();
+        player.seekTo(0);
+        player.playVideo();
       }
     }
 
-    function playNext() {
-      currentIndex++;
-      if (currentIndex < videoIds.length) {
-        player.loadVideoById(videoIds[currentIndex].id);
-        renderPlaylist();
-      } else {
-        document.getElementById('status').innerText = '모든 재생 목록이 끝났습니다.';
-      }
+    // 재생 불가 영상(오류 153 등) 감지 시 블랙리스트 등록 후 이전 최신 곡으로 복구
+    function onPlayerError(event) {
+      console.warn(`재생 불가 영상 스킵 (오류 코드: ${event.data}, ID: ${currentVideo.id})`);
+      blockedVideoIds.add(currentVideo.id);
+      document.getElementById('status').innerText = `외부 재생이 제한된 영상(${currentVideo.id})을 건너뛰고 이전 곡을 불러옵니다...`;
+      currentVideo = null;
+      setTimeout(checkLatestVideo, 1000);
     }
 
-    function renderPlaylist() {
-      const container = document.getElementById('playlist');
-      container.innerHTML = videoIds.map((item, idx) => `
-        <div class="playlist-item ${idx === currentIndex ? 'active' : ''}" onclick="jumpTo(${idx})">
-          ${idx + 1}. [작성자: ${item.author}] (ID: ${item.id})
-        </div>
-      `).join('');
-    }
-
-    window.jumpTo = function(index) {
-      currentIndex = index;
-      player.loadVideoById(videoIds[currentIndex].id);
-      renderPlaylist();
-    };
-
+    // 9. 시작 진입점
     function onYouTubeIframeAPIReady() {
-      fetchToots();
+      checkLatestVideo();
+      connectWebSocket();
+      setInterval(checkLatestVideo, POLLING_INTERVAL);
     }
   </script>
 </body>
